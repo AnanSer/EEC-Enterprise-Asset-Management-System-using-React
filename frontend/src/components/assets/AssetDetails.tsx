@@ -1,0 +1,661 @@
+'use client';
+
+import React, { useState } from 'react';
+import Link from 'next/link';
+import {
+  Tag,
+  Hash,
+  Monitor,
+  Building2,
+  MapPin,
+  Calendar,
+  DollarSign,
+  Shield,
+  FileText,
+  Edit2,
+  Wrench,
+  User,
+  Clock,
+  ArrowRightLeft,
+  RotateCcw,
+  History,
+  Plus,
+  UserCheck,
+  CheckCircle2,
+  ArrowLeft,
+} from 'lucide-react';
+import StatusBadge from '@/components/ui/StatusBadge';
+import {
+  Asset,
+  ASSET_CATEGORY_LABELS,
+  ASSET_STATUS_LABELS,
+  ASSET_CONDITION_LABELS,
+} from '@/constants/assets';
+import TransferModal from '@/components/assignments/TransferModal';
+import ReturnModal from '@/components/assignments/ReturnModal';
+import AssignmentTimeline from '@/components/assignments/AssignmentTimeline';
+import AssetMovementHistory from './AssetMovementHistory';
+import UpdateLocationModal from './UpdateLocationModal';
+import AssetThumbnail from './AssetThumbnail';
+import maintenanceService from '@/services/maintenance.service';
+import { MaintenanceTicket } from '@/constants/maintenance';
+import { usePermissions } from '@/hooks/usePermissions';
+import { useAuthSession } from '@/context/AuthSessionContext';
+import { PERMISSIONS, ROLES } from '@/lib/authorization';
+
+interface AssetDetailsProps {
+  asset: Asset;
+  onRefresh?: () => void;
+  isReturnedView?: boolean;
+}
+
+function InfoCard({
+  title,
+  children,
+  action,
+}: {
+  title: string;
+  children: React.ReactNode;
+  action?: React.ReactNode;
+}) {
+  return (
+    <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
+      <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+        <h3 className="text-sm font-bold text-eec-text uppercase tracking-wider">
+          {title}
+        </h3>
+        {action}
+      </div>
+      <div className="space-y-3">{children}</div>
+    </div>
+  );
+}
+
+function InfoRow({
+  icon: Icon,
+  label,
+  value,
+  href,
+}: {
+  icon: React.ElementType;
+  label: string;
+  value?: React.ReactNode;
+  href?: string;
+}) {
+  return (
+    <div className="flex items-start gap-3">
+      <div className="w-8 h-8 rounded-lg bg-slate-50 border border-slate-100 flex items-center justify-center shrink-0 mt-0.5">
+        <Icon className="w-4 h-4 text-slate-500" />
+      </div>
+      <div>
+        <p className="text-xs text-slate-400 font-medium">{label}</p>
+        {href ? (
+          <Link
+            href={href}
+            className="text-sm font-semibold text-eec-primary hover:underline mt-0.5 block"
+          >
+            {value || '—'}
+          </Link>
+        ) : (
+          <p className="text-sm font-semibold text-slate-700 mt-0.5">{value || '—'}</p>
+        )}
+      </div>
+    </div>
+  );
+}
+
+function formatDate(dateStr?: string | null) {
+  if (!dateStr) return null;
+  try {
+    return new Date(dateStr).toLocaleDateString('en-GB', {
+      day: '2-digit',
+      month: 'short',
+      year: 'numeric',
+    });
+  } catch {
+    return dateStr;
+  }
+}
+
+function warrantyLabel(warrantyExpiry?: string | null): { label: string; status: string } {
+  if (!warrantyExpiry) return { label: 'No Warranty', status: 'inactive' };
+  const expiry = new Date(warrantyExpiry);
+  const now = new Date();
+  const daysLeft = Math.ceil((expiry.getTime() - now.getTime()) / (1000 * 60 * 60 * 24));
+  if (daysLeft < 0) return { label: 'Expired', status: 'disposed' };
+  if (daysLeft < 90) return { label: `Expiring in ${daysLeft}d`, status: 'maintenance' };
+  return { label: `Valid until ${formatDate(warrantyExpiry)}`, status: 'available' };
+}
+
+export default function AssetDetails({
+  asset,
+  onRefresh,
+  isReturnedView: propReturnedView,
+}: AssetDetailsProps) {
+  const { can, isAdmin, isTechnician, isStoreKeeper, isEmployee } = usePermissions();
+  const { user: authUser } = useAuthSession();
+  const assignmentsCount = asset._count?.assignments ?? 0;
+  const maintenanceCount = asset._count?.maintenanceTickets ?? 0;
+  const warranty = warrantyLabel(asset.warrantyExpiry);
+
+  const [showTransferModal, setShowTransferModal] = useState(false);
+  const [showReturnModal, setShowReturnModal] = useState(false);
+  const [showLocationModal, setShowLocationModal] = useState(false);
+  const [refreshTimelineTrigger, setRefreshTimelineTrigger] = useState(0);
+
+  const [maintenanceTickets, setMaintenanceTickets] = useState<MaintenanceTicket[]>([]);
+  const [loadingMaintenance, setLoadingMaintenance] = useState(true);
+
+  React.useEffect(() => {
+    async function loadAssetMaintenance() {
+      try {
+        setLoadingMaintenance(true);
+        const res = await maintenanceService.getAll({ assetId: asset.id, limit: 20 });
+        if (res.success) {
+          setMaintenanceTickets(res.data);
+        }
+      } catch {
+        // Non-blocking
+      } finally {
+        setLoadingMaintenance(false);
+      }
+    }
+
+    loadAssetMaintenance();
+  }, [asset.id, refreshTimelineTrigger]);
+
+  const currentAssignment = asset.currentAssignment;
+  const isAssigned = asset.status === 'ASSIGNED' && Boolean(currentAssignment);
+
+  // Check if current user is the current active custodian
+  const isCurrentHolder = Boolean(
+    authUser?.employeeProfile?.id &&
+    currentAssignment?.employeeId === authUser.employeeProfile.id
+  );
+
+  // Is this view for a returned asset / custody released view?
+  const isReturnedCustody = Boolean(
+    propReturnedView ||
+    asset.custodyStatus === 'RETURNED' ||
+    (isEmployee && !isCurrentHolder)
+  );
+
+  return (
+    <div className="space-y-6">
+      {/* Top Banner with Thumbnail Card */}
+      <div className="bg-white rounded-2xl border border-slate-200 shadow-sm p-6 flex flex-col md:flex-row md:items-center justify-between gap-5">
+        <div className="flex items-center gap-4">
+          <AssetThumbnail
+            category={asset.category}
+            alt={asset.name}
+            size="xl"
+            className="w-20 h-20 p-2 rounded-2xl border border-slate-200 bg-slate-50/75 shadow-xs"
+          />
+          <div>
+            <div className="flex items-center gap-2.5 flex-wrap">
+              <h2 className="text-xl font-bold text-eec-text">{asset.name}</h2>
+              <span className="font-mono text-xs font-semibold px-2 py-0.5 rounded bg-eec-primary/10 text-eec-primary border border-eec-primary/20">
+                {asset.assetCode}
+              </span>
+              <span className="inline-flex items-center px-2 py-0.5 rounded text-xs font-semibold bg-slate-100 text-slate-700 border border-slate-200">
+                {ASSET_CATEGORY_LABELS[asset.category] ?? asset.category}
+              </span>
+              <StatusBadge
+                status={asset.status.toLowerCase()}
+                label={ASSET_STATUS_LABELS[asset.status] ?? asset.status}
+              />
+            </div>
+            <p className="text-sm text-slate-500 mt-1">
+              {[asset.brand, asset.model].filter(Boolean).join(' · ') || 'No brand / model specified'}
+            </p>
+          </div>
+        </div>
+
+        {/* Action Buttons */}
+        <div className="flex items-center gap-2.5 shrink-0 flex-wrap">
+          {isReturnedCustody && (
+            <Link
+              href="/my-assets"
+              className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50 transition shadow-2xs"
+            >
+              <ArrowLeft className="w-3.5 h-3.5 text-slate-500" />
+              Back to My Assets
+            </Link>
+          )}
+
+          <Link
+            href={`/assignments/history/${asset.id}`}
+            className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg border border-slate-300 bg-white text-xs font-semibold text-slate-700 hover:bg-slate-50 transition shadow-2xs"
+          >
+            <History className="w-4 h-4 text-slate-500" />
+            History ({assignmentsCount})
+          </Link>
+
+          {!isReturnedCustody && (
+            <>
+              {asset.status === 'AVAILABLE' && can(PERMISSIONS.ASSETS_ASSIGN) && (
+                <Link
+                  href={`/assignments/new?assetId=${asset.id}`}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-emerald-600 text-white text-xs font-semibold hover:bg-emerald-700 transition shadow-xs"
+                >
+                  <Plus className="w-4 h-4" />
+                  Assign Asset
+                </Link>
+              )}
+
+              {(isAdmin || isTechnician || isCurrentHolder) && (
+                <Link
+                  href={`/maintenance/new?assetId=${asset.id}`}
+                  className="inline-flex items-center gap-1.5 px-3.5 py-2 rounded-lg bg-orange-600 text-white text-xs font-semibold hover:bg-orange-700 transition shadow-xs"
+                >
+                  <Wrench className="w-3.5 h-3.5" />
+                  Request Maintenance
+                </Link>
+              )}
+
+              {can(PERMISSIONS.ASSETS_UPDATE) && (
+                <Link
+                  href={`/assets/${asset.id}/edit`}
+                  className="inline-flex items-center gap-2 px-4 py-2 rounded-lg bg-eec-primary text-white text-xs font-semibold hover:bg-eec-primary/90 transition shadow-xs"
+                >
+                  <Edit2 className="w-3.5 h-3.5" />
+                  Edit Asset
+                </Link>
+              )}
+            </>
+          )}
+        </div>
+      </div>
+
+      {/* Custody Banner for Returned Assets */}
+      {isReturnedCustody && (
+        <div className="bg-slate-50 border border-slate-200/90 rounded-xl px-4 py-3 flex items-center justify-between gap-3 text-xs text-slate-600">
+          <div className="flex items-center gap-2.5">
+            <CheckCircle2 className="w-4 h-4 text-slate-500 shrink-0" />
+            <span>
+              This equipment has been safely returned to the company store. This page provides historical and technical specification information only.
+            </span>
+          </div>
+          <span className="font-semibold text-slate-600 bg-slate-200/70 border border-slate-300/80 px-2.5 py-0.5 rounded text-[11px] uppercase tracking-wider shrink-0">
+            Returned Custody
+          </span>
+        </div>
+      )}
+
+      {/* Quick Counts */}
+      <div className="grid grid-cols-2 gap-4">
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-blue-50 flex items-center justify-center">
+            <Monitor className="w-5 h-5 text-blue-600" />
+          </div>
+          <div>
+            <p className="text-2xl font-bold text-eec-text">{assignmentsCount}</p>
+            <p className="text-xs text-slate-500 font-medium">Assignment Records</p>
+          </div>
+        </div>
+        <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-4 flex items-center gap-3">
+          <div className="w-10 h-10 rounded-xl bg-orange-50 flex items-center justify-center">
+            <Wrench className="w-5 h-5 text-orange-600" />
+          </div>
+          <div>
+            <p className="text-2xl font-bold text-eec-text">
+              {maintenanceCount || maintenanceTickets.length}
+            </p>
+            <p className="text-xs text-slate-500 font-medium">Maintenance Tickets</p>
+          </div>
+        </div>
+      </div>
+
+      {/* Asset Status Card — read-only */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-5">
+        <h3 className="text-sm font-semibold text-slate-500 uppercase tracking-wide mb-4">Asset Status</h3>
+        <div className="grid grid-cols-2 md:grid-cols-4 gap-4">
+          {/* Status */}
+          <div className="space-y-1.5">
+            <p className="text-xs text-slate-400 font-medium">Operational Status</p>
+            <StatusBadge
+              status={asset.status.toLowerCase()}
+              label={ASSET_STATUS_LABELS[asset.status] ?? asset.status}
+            />
+          </div>
+
+          {/* Condition */}
+          <div className="space-y-1.5">
+            <p className="text-xs text-slate-400 font-medium">Physical Condition</p>
+            <StatusBadge
+              status={asset.condition.toLowerCase()}
+              label={ASSET_CONDITION_LABELS[asset.condition] ?? asset.condition}
+            />
+          </div>
+
+          {/* Warranty */}
+          <div className="space-y-1.5">
+            <p className="text-xs text-slate-400 font-medium">Warranty</p>
+            <StatusBadge status={warranty.status} label={warranty.label} />
+          </div>
+
+          {/* Assigned Employee */}
+          <div className="space-y-1.5">
+            <p className="text-xs text-slate-400 font-medium">Assigned To</p>
+            {currentAssignment ? (
+              <Link
+                href={currentAssignment.employeeId ? `/employees/${currentAssignment.employeeId}` : '#'}
+                className="flex items-center gap-1.5 group"
+              >
+                <div className="w-6 h-6 rounded-full bg-eec-primary/10 flex items-center justify-center shrink-0">
+                  <User className="w-3.5 h-3.5 text-eec-primary" />
+                </div>
+                <span className="text-xs font-semibold text-eec-text group-hover:text-eec-primary transition truncate">
+                  {currentAssignment.employeeName}
+                </span>
+              </Link>
+            ) : (
+              <div className="flex items-center gap-1.5">
+                <div className="w-6 h-6 rounded-full bg-slate-100 flex items-center justify-center">
+                  <User className="w-3.5 h-3.5 text-slate-400" />
+                </div>
+                <span className="text-xs text-slate-400 italic">Not Assigned Yet</span>
+              </div>
+            )}
+          </div>
+        </div>
+
+        {/* Last Updated */}
+        <div className="mt-4 pt-4 border-t border-slate-100 flex items-center gap-1.5 text-xs text-slate-400">
+          <Clock className="w-3.5 h-3.5" />
+          Last updated: {formatDate(asset.updatedAt) ?? '—'}
+        </div>
+      </div>
+
+      {/* Assignment Information Card */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
+        <div className="flex flex-col sm:flex-row sm:items-center justify-between gap-3 border-b border-slate-100 pb-3">
+          <h3 className="text-sm font-bold text-eec-text uppercase tracking-wider flex items-center gap-2">
+            <UserCheck className="w-4 h-4 text-eec-accent" />
+            Assignment Information
+          </h3>
+
+          {/* Action Buttons: Transfer & Return (only visible when asset is ASSIGNED, not in returned custody view, and user has assign permission) */}
+          {!isReturnedCustody && asset.status === 'ASSIGNED' && can(PERMISSIONS.ASSETS_ASSIGN) && (
+            <div className="flex items-center gap-2">
+              <button
+                type="button"
+                onClick={() => setShowTransferModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-blue-50 text-blue-700 hover:bg-blue-100 text-xs font-semibold transition"
+              >
+                <ArrowRightLeft className="w-3.5 h-3.5" />
+                Transfer Asset
+              </button>
+              <button
+                type="button"
+                onClick={() => setShowReturnModal(true)}
+                className="inline-flex items-center gap-1.5 px-3 py-1.5 rounded-lg bg-amber-50 text-amber-700 hover:bg-amber-100 text-xs font-semibold transition"
+              >
+                <RotateCcw className="w-3.5 h-3.5" />
+                Return Asset
+              </button>
+            </div>
+          )}
+        </div>
+
+        {isAssigned && currentAssignment ? (
+          <div className="grid grid-cols-1 sm:grid-cols-2 md:grid-cols-3 gap-5">
+            <InfoRow
+              icon={User}
+              label="Current Holder"
+              value={currentAssignment.employeeName}
+              href={currentAssignment.employeeId ? `/employees/${currentAssignment.employeeId}` : undefined}
+            />
+            <InfoRow
+              icon={Tag}
+              label="Employee ID"
+              value={currentAssignment.employeeBadgeId || '—'}
+            />
+            <InfoRow
+              icon={Building2}
+              label="Department"
+              value={currentAssignment.departmentName || '—'}
+            />
+            <InfoRow
+              icon={Calendar}
+              label="Assigned Date"
+              value={formatDate(currentAssignment.assignedDate)}
+            />
+            <InfoRow
+              icon={FileText}
+              label="Remarks"
+              value={currentAssignment.remarks || 'No handover remarks provided'}
+            />
+          </div>
+        ) : (
+          <div className="p-4 rounded-lg bg-slate-50 border border-slate-100 text-xs text-slate-500 space-y-2">
+            <div className="flex items-center justify-between">
+              <p>
+                {isReturnedCustody
+                  ? 'This equipment was returned to the company store and is currently in Available inventory without an active custodian.'
+                  : 'This equipment is currently stored in Available inventory and has no active custodian.'}
+              </p>
+              {!isReturnedCustody && can(PERMISSIONS.ASSETS_ASSIGN) && (
+                <Link
+                  href={`/assignments/new?assetId=${asset.id}`}
+                  className="font-semibold text-eec-primary hover:underline inline-flex items-center gap-1 shrink-0"
+                >
+                  <Plus className="w-3.5 h-3.5" /> Assign Now
+                </Link>
+              )}
+            </div>
+            {isReturnedCustody && asset.returnedAssignment?.receivedBy && (
+              <div className="flex items-center gap-2 pt-2 border-t border-slate-200/60 flex-wrap">
+                <span className="flex items-center gap-1 text-slate-600 font-medium">
+                  <UserCheck className="w-3.5 h-3.5 text-emerald-600" />
+                  Receipt Confirmed & Approved By:
+                </span>
+                <span className="font-bold text-emerald-800 bg-emerald-50 px-2 py-0.5 rounded border border-emerald-200/80">
+                  {asset.returnedAssignment.receivedBy}
+                </span>
+                {asset.returnedAssignment.returnedDate && (
+                  <span className="text-slate-400 text-2xs">
+                    on {formatDate(asset.returnedAssignment.returnedDate)}
+                  </span>
+                )}
+              </div>
+            )}
+          </div>
+        )}
+      </div>
+
+      {/* Asset Movement History Card */}
+      <AssetMovementHistory
+        assetId={asset.id}
+        refreshTrigger={refreshTimelineTrigger}
+      />
+
+      {/* Maintenance & Repair History Card */}
+      <div className="bg-white rounded-xl border border-slate-200 shadow-sm p-6 space-y-4">
+        <div className="flex items-center justify-between border-b border-slate-100 pb-3">
+          <div className="flex items-center gap-2">
+            <Wrench className="w-4 h-4 text-orange-600" />
+            <h3 className="text-sm font-bold text-slate-800 uppercase tracking-wider">
+              Maintenance &amp; Repair History ({maintenanceTickets.length})
+            </h3>
+          </div>
+          {!isReturnedCustody && (isAdmin || isTechnician || isCurrentHolder) && (
+            <Link
+              href={`/maintenance/new?assetId=${asset.id}`}
+              className="text-xs font-semibold text-orange-600 hover:text-orange-700 hover:underline flex items-center gap-1"
+            >
+              <Plus className="w-3.5 h-3.5" /> Request Maintenance
+            </Link>
+          )}
+        </div>
+
+        {loadingMaintenance ? (
+          <p className="text-xs text-slate-400 py-3 italic">Loading maintenance history...</p>
+        ) : maintenanceTickets.length > 0 ? (
+          <div className="divide-y divide-slate-100">
+            {maintenanceTickets.map((t) => (
+              <div key={t.id} className="py-3 flex items-start justify-between gap-4">
+                <div>
+                  <div className="flex items-center gap-2">
+                    <Link
+                      href={`/maintenance/${t.id}`}
+                      className="font-mono text-xs font-bold text-eec-primary hover:underline"
+                    >
+                      {t.ticketNumber}
+                    </Link>
+                    <span className="text-xs font-semibold text-slate-700">
+                      {t.category}
+                    </span>
+                    <StatusBadge status={t.status.toLowerCase()} />
+                  </div>
+                  <p className="text-xs text-slate-600 mt-1 line-clamp-2">
+                    {t.description}
+                  </p>
+                  <div className="flex items-center gap-3 text-[11px] text-slate-400 mt-1.5">
+                    <span>Reported: {formatDate(t.createdAt) || '—'}</span>
+                    <span>•</span>
+                    <span>Technician: {t.assignedTechnician || 'Unassigned'}</span>
+                    {t.cost && (
+                      <>
+                        <span>•</span>
+                        <span className="font-semibold text-slate-700">
+                          {Number(t.cost).toLocaleString()} ETB
+                        </span>
+                      </>
+                    )}
+                  </div>
+                </div>
+
+                <Link
+                  href={`/maintenance/${t.id}`}
+                  className="px-2.5 py-1 text-xs font-medium text-slate-600 hover:text-eec-primary hover:bg-slate-50 border border-slate-200 rounded-md shrink-0 transition-colors"
+                >
+                  View Ticket
+                </Link>
+              </div>
+            ))}
+          </div>
+        ) : (
+          <div className="p-4 bg-slate-50 rounded-lg text-center border border-dashed border-slate-200">
+            <p className="text-xs text-slate-500">No maintenance tickets recorded for this asset.</p>
+          </div>
+        )}
+      </div>
+
+      {/* Detail Cards */}
+      <div className="grid grid-cols-1 md:grid-cols-2 gap-5">
+        {/* Asset Identity */}
+        <InfoCard title="Asset Identity">
+          <InfoRow icon={Tag} label="Asset Code" value={asset.assetCode} />
+          <InfoRow icon={Hash} label="Serial Number" value={asset.serialNumber} />
+          <InfoRow icon={Monitor} label="Category" value={ASSET_CATEGORY_LABELS[asset.category] ?? asset.category} />
+          <InfoRow icon={Monitor} label="Brand" value={asset.brand} />
+          <InfoRow icon={Monitor} label="Model" value={asset.model} />
+        </InfoCard>
+
+        {/* Location */}
+        <InfoCard
+          title="Location &amp; Facility"
+          action={
+            (!isReturnedCustody && (isAdmin || isTechnician || isStoreKeeper)) ? (
+              <button
+                type="button"
+                onClick={() => setShowLocationModal(true)}
+                className="text-xs font-semibold text-eec-primary hover:underline flex items-center gap-1"
+              >
+                <Edit2 className="w-3.5 h-3.5" /> Edit Location
+              </button>
+            ) : undefined
+          }
+        >
+          <InfoRow icon={Building2} label="Department" value={asset.department?.name} />
+          <InfoRow icon={MapPin} label="Physical Location" value={asset.location || '—'} />
+          <InfoRow icon={MapPin} label="Office Location" value={asset.department?.officeLocation} />
+          <InfoRow icon={Building2} label="Building" value={asset.department?.building} />
+          <InfoRow icon={MapPin} label="Floor" value={asset.department?.floor} />
+        </InfoCard>
+
+        {/* Purchase & Warranty */}
+        <InfoCard title="Purchase &amp; Warranty">
+          <InfoRow icon={Calendar} label="Purchase Date" value={formatDate(asset.purchaseDate)} />
+          <InfoRow
+            icon={DollarSign}
+            label="Purchase Price"
+            value={
+              asset.purchasePrice != null
+                ? `ETB ${Number(asset.purchasePrice).toLocaleString('en-US', { minimumFractionDigits: 2 })}`
+                : null
+            }
+          />
+          <InfoRow icon={Shield} label="Warranty Expiry" value={formatDate(asset.warrantyExpiry)} />
+        </InfoCard>
+
+        {/* Notes */}
+        <InfoCard title="Notes">
+          <div className="flex items-start gap-3">
+            <div className="w-8 h-8 rounded-lg bg-slate-50 border border-slate-100 flex items-center justify-center shrink-0 mt-0.5">
+              <FileText className="w-4 h-4 text-slate-500" />
+            </div>
+            <p className="text-sm text-slate-600 mt-0.5 leading-relaxed">
+              {asset.notes || 'No notes recorded for this asset.'}
+            </p>
+          </div>
+        </InfoCard>
+      </div>
+
+      {/* Update Location Modal */}
+      {showLocationModal && (
+        <UpdateLocationModal
+          isOpen={showLocationModal}
+          onClose={() => setShowLocationModal(false)}
+          asset={{
+            id: asset.id,
+            assetCode: asset.assetCode,
+            name: asset.name,
+            location: asset.location,
+          }}
+          onSuccess={() => {
+            if (onRefresh) onRefresh();
+          }}
+        />
+      )}
+
+      {/* Transfer Modal */}
+      {showTransferModal && currentAssignment && (
+        <TransferModal
+          isOpen={showTransferModal}
+          onClose={() => setShowTransferModal(false)}
+          asset={{
+            id: asset.id,
+            assetCode: asset.assetCode,
+            name: asset.name,
+            currentHolderName: currentAssignment.employeeName,
+            currentEmployeeId: currentAssignment.employeeId,
+          }}
+          onSuccess={() => {
+            setRefreshTimelineTrigger((prev) => prev + 1);
+            if (onRefresh) onRefresh();
+          }}
+        />
+      )}
+
+      {/* Return Modal */}
+      {showReturnModal && currentAssignment && (
+        <ReturnModal
+          isOpen={showReturnModal}
+          onClose={() => setShowReturnModal(false)}
+          asset={{
+            id: asset.id,
+            assetCode: asset.assetCode,
+            name: asset.name,
+            currentHolderName: currentAssignment.employeeName,
+          }}
+          onSuccess={() => {
+            setRefreshTimelineTrigger((prev) => prev + 1);
+            if (onRefresh) onRefresh();
+          }}
+        />
+      )}
+    </div>
+  );
+}

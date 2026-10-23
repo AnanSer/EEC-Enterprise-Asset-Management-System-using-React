@@ -1,0 +1,347 @@
+import { Request, Response } from 'express';
+import { assetService, AssetService, AppError } from './asset.service';
+import {
+  createAssetSchema,
+  updateAssetSchema,
+  updateAssetStatusSchema,
+  updateAssetLocationSchema,
+  assetQuerySchema,
+} from './asset.validator';
+import prisma from '../../lib/prisma';
+import { ROLES, type Role } from '../../constants';
+import { canAccessAsset, AuthUserContext } from '../../lib/authorization';
+import {
+  successResponse,
+  createdResponse,
+  errorResponse,
+  paginatedResponse,
+  buildPagination,
+} from '../../lib/api';
+
+export class AssetController {
+  constructor(private service: AssetService = assetService) {}
+
+  getAll = async (req: Request, res: Response) => {
+    try {
+      const parsedQuery = assetQuerySchema.parse(req.query);
+
+      // Scoped access based on authenticated user role
+      if (req.auth?.user) {
+        const user = await prisma.user.findFirst({
+          where: { OR: [{ id: req.auth.user.id }, { email: req.auth.user.email }] },
+          include: { employeeProfile: true },
+        });
+
+        if (user) {
+          const role = user.role as Role;
+          const isPersonal = parsedQuery.personal === 'true' || parsedQuery.personal === true || role === ROLES.EMPLOYEE;
+
+          // Personal view: View assets assigned or previously assigned (returned) to logged-in user
+          if (isPersonal) {
+            if (user.employeeProfile) {
+              const allEmployeeAssignments = await prisma.assetAssignment.findMany({
+                where: {
+                  employeeId: user.employeeProfile.id,
+                },
+                orderBy: {
+                  assignedDate: 'desc',
+                },
+                include: {
+                  asset: {
+                    include: {
+                      department: { select: { id: true, code: true, name: true } },
+                      assignments: {
+                        where: { employeeId: user.employeeProfile.id },
+                        orderBy: { assignedDate: 'desc' },
+                        take: 5,
+                        include: {
+                          employee: {
+                            select: { id: true, employeeId: true, firstName: true, lastName: true },
+                          },
+                        },
+                      },
+                      returnRequests: {
+                        where: { status: 'RECEIVED' },
+                        orderBy: { receivedAt: 'desc' },
+                        take: 1,
+                        include: {
+                          receivedBy: {
+                            select: {
+                              id: true,
+                              email: true,
+                              role: true,
+                              employeeProfile: {
+                                select: { firstName: true, lastName: true },
+                              },
+                            },
+                          },
+                        },
+                      },
+                    },
+                  },
+                },
+              });
+
+              // Deduplicate by assetId: preserve current active assignment over past returned assignment
+              const assetMap = new Map<string, any>();
+              for (const asgn of allEmployeeAssignments) {
+                if (!assetMap.has(asgn.assetId)) {
+                  assetMap.set(asgn.assetId, asgn);
+                } else if (asgn.isCurrent) {
+                  assetMap.set(asgn.assetId, asgn);
+                }
+              }
+
+              let userAssets = Array.from(assetMap.values()).map((asgn) => {
+                const baseAsset = asgn.asset;
+                const isCurrent = asgn.isCurrent;
+                const custodyStatus = isCurrent ? 'ASSIGNED' : 'RETURNED';
+
+                const returnReq = baseAsset.returnRequests?.[0];
+                const receiverName = returnReq?.receivedBy?.employeeProfile
+                  ? `${returnReq.receivedBy.employeeProfile.firstName} ${returnReq.receivedBy.employeeProfile.lastName}`
+                  : returnReq?.receivedBy?.email || 'Store Keeper';
+
+                return {
+                  ...baseAsset,
+                  custodyStatus,
+                  currentAssignment: isCurrent
+                    ? {
+                        id: asgn.id,
+                        employeeId: asgn.employeeId,
+                        employeeName: `${user.employeeProfile?.firstName} ${user.employeeProfile?.lastName}`,
+                        departmentName: baseAsset.department?.name,
+                        assignedDate: asgn.assignedDate,
+                        remarks: asgn.notes,
+                        isCurrent: true,
+                      }
+                    : null,
+                  returnedAssignment: !isCurrent
+                    ? {
+                        id: asgn.id,
+                        employeeId: asgn.employeeId,
+                        assignedDate: asgn.assignedDate,
+                        returnedDate: asgn.returnedDate,
+                        conditionOnReturn: asgn.conditionOnReturn,
+                        notes: asgn.notes,
+                        isCurrent: false,
+                        receivedBy: receiverName,
+                        receivedByEmail: returnReq?.receivedBy?.email || null,
+                      }
+                    : null,
+                };
+              });
+
+              // Filter by status if provided (supports 'ASSIGNED', 'RETURNED', or regular asset status)
+              if (parsedQuery.status && parsedQuery.status !== 'all') {
+                if (parsedQuery.status === 'ASSIGNED') {
+                  userAssets = userAssets.filter((a) => a.custodyStatus === 'ASSIGNED');
+                } else if (parsedQuery.status === 'RETURNED') {
+                  userAssets = userAssets.filter((a) => a.custodyStatus === 'RETURNED');
+                } else {
+                  userAssets = userAssets.filter((a) => a.status === parsedQuery.status);
+                }
+              }
+
+              return res.status(200).json(
+                paginatedResponse(userAssets, buildPagination(1, 50, userAssets.length))
+              );
+            } else {
+              return res.status(200).json(
+                paginatedResponse([], buildPagination(1, 50, 0))
+              );
+            }
+          }
+
+          // DEPARTMENT_MANAGER: View only assets inside own department
+          if (role === ROLES.DEPARTMENT_MANAGER && user.employeeProfile?.departmentId) {
+            parsedQuery.departmentId = user.employeeProfile.departmentId;
+          }
+        }
+      }
+
+      const { assets, meta } = await this.service.getAssets(parsedQuery);
+      const pagination = buildPagination(meta.page, meta.limit, meta.total);
+
+      return res.status(200).json(
+        paginatedResponse(assets, pagination)
+      );
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  getById = async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const asset = await this.service.getAssetById(id);
+
+      if (!asset) {
+        return res.status(404).json(
+          errorResponse('Asset not found')
+        );
+      }
+
+      // Check ownership & department access
+      if (req.auth?.user) {
+        const user = await prisma.user.findFirst({
+          where: { OR: [{ id: req.auth.user.id }, { email: req.auth.user.email }] },
+          include: { employeeProfile: true },
+        });
+
+        if (user) {
+          const authContext: AuthUserContext = {
+            userId: user.id,
+            role: user.role as Role,
+            departmentId: user.employeeProfile?.departmentId,
+            employeeProfileId: user.employeeProfile?.id,
+            employeeId: user.employeeProfile?.employeeId,
+            name: user.employeeProfile
+              ? `${user.employeeProfile.firstName} ${user.employeeProfile.lastName}`.trim()
+              : null,
+          };
+
+          let allowed = canAccessAsset(authContext, asset);
+
+          // Allow employee to view asset if they are currently assigned or were previously assigned this asset (returned custody)
+          if (!allowed && user.role === ROLES.EMPLOYEE && user.employeeProfile?.id) {
+            const hasAssignment = await prisma.assetAssignment.findFirst({
+              where: {
+                assetId: id,
+                employeeId: user.employeeProfile.id,
+              },
+            });
+            if (hasAssignment) {
+              allowed = true;
+            }
+          }
+
+          if (!allowed) {
+            return res.status(403).json(
+              errorResponse('Forbidden: You do not have permission to view this asset')
+            );
+          }
+        }
+      }
+
+      return res.status(200).json(
+        successResponse(asset)
+      );
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  create = async (req: Request, res: Response) => {
+    try {
+      const validatedData = createAssetSchema.parse(req.body);
+      const newAsset = await this.service.createAsset(validatedData);
+
+      return res.status(201).json(
+        createdResponse(newAsset, null, 'Asset registered successfully')
+      );
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  update = async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const validatedData = updateAssetSchema.parse(req.body);
+      const updated = await this.service.updateAsset(id, validatedData);
+
+      return res.status(200).json(
+        successResponse(updated, null, 'Asset updated successfully')
+      );
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  updateStatus = async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const { status } = updateAssetStatusSchema.parse(req.body);
+      const updated = await this.service.updateStatus(id, status);
+
+      return res.status(200).json(
+        successResponse(updated, null, `Asset status updated to '${status}'`)
+      );
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  updateLocation = async (req: Request, res: Response) => {
+    try {
+      const id = String(req.params.id);
+      const { location } = updateAssetLocationSchema.parse(req.body);
+      const updated = await this.service.updateLocation(id, location ?? null);
+
+      return res.status(200).json(
+        successResponse(updated, null, 'Asset location updated successfully')
+      );
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  getInventory = async (req: Request, res: Response) => {
+    try {
+      let departmentId: string | undefined = undefined;
+
+      if (req.auth?.user) {
+        const user = await prisma.user.findFirst({
+          where: { OR: [{ id: req.auth.user.id }, { email: req.auth.user.email }] },
+          include: { employeeProfile: true },
+        });
+
+        if (user) {
+          const role = user.role as Role;
+          // Security Guard: EMPLOYEES are strictly forbidden from organization inventory
+          if (role === ROLES.EMPLOYEE) {
+            return res.status(403).json(
+              errorResponse('Forbidden: Employees cannot access organization inventory', 403)
+            );
+          }
+
+          // Department Managers only see inventory in their assigned department
+          if (role === ROLES.DEPARTMENT_MANAGER && user.employeeProfile?.departmentId) {
+            departmentId = user.employeeProfile.departmentId;
+          }
+        }
+      }
+
+      const inventory = await this.service.getInventory(departmentId);
+      return res.status(200).json(successResponse(inventory));
+    } catch (err: any) {
+      return this.handleError(res, err);
+    }
+  };
+
+  private handleError(res: Response, err: any) {
+    if (err instanceof AppError) {
+      return res.status(err.statusCode).json(
+        errorResponse(err.message, err.statusCode, err.errors)
+      );
+    }
+
+    if (err?.name === 'ZodError') {
+      const formattedErrors = err.issues?.map((issue: any) => ({
+        field: issue.path.join('.'),
+        message: issue.message,
+      }));
+      return res.status(422).json(
+        errorResponse('Validation failed', 422, formattedErrors)
+      );
+    }
+
+    console.error('Unhandled Asset Error:', err);
+    return res.status(500).json(
+      errorResponse('Internal server error')
+    );
+  }
+}
+
+export const assetController = new AssetController();
